@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Suivi Conso BCI</title>
+  <meta name="theme-color" content="#BE1E34">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Suivi Conso">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <img class="pinwheel" src="/pinwheel.png" alt="" aria-hidden="true">
+  <header class="topbar" id="topbar" hidden>
+    <a href="#/" class="brand"><img src="/mark.png" alt=""><span>Suivi <b>Conso</b></span></a>
+    <nav id="nav"></nav>
+    <div class="who"><span id="whoName"></span><button class="btn-ghost sm" id="logoutBtn">Déconnexion</button></div>
+  </header>
+  <main id="app" class="container"><p class="muted center pad">Chargement…</p></main>
+  <footer class="foot">BCI Solutions · Groupe ABF — Suivi consommation combles</footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js" defer></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
