@@ -2,12 +2,24 @@
 import crypto from "node:crypto";
 import { getStoreInstance, listAll, getMany, updateJSON } from "./lib/store.mjs";
 
+// Matières : codes = préfixes du « Produit à Poser » Salesforce (ex. SUPAR7 → SUPA, R7)
+// bagsPerM2 = sacs par m² pour un R7 ; le prévu est proportionnel au R du produit
+const DEFAULT_MATERIALS = [
+  { id: "supafil", name: "SUPAFIL (Cover+)", codes: ["SUPACOVER+", "MIKITSUPA", "SUPA"], bagsPerM2: 0.21 },
+  { id: "meca", name: "MECA", codes: ["MECA"], bagsPerM2: 0.21, aConfirmer: true },
+  { id: "roche", name: "ROCHE", codes: ["ROCHE"], bagsPerM2: 0.21, aConfirmer: true },
+  { id: "igloo", name: "IGLOO", codes: ["IGLOO"], bagsPerM2: 0.21, aConfirmer: true },
+  { id: "mesange", name: "MESANGE", codes: ["MESANGE"], bagsPerM2: 0.21, aConfirmer: true },
+  { id: "ouatitude", name: "OUATTITUDE", codes: ["OUATTITUDE"], bagsPerM2: 0.21, aConfirmer: true },
+];
 const DEFAULT_CONFIG = {
   targetCm: 33,
   depots: ["BEYNOST", "FIRMINY"],
-  materials: [{ id: "supafil-cover", name: "SUPAFIL COVER+", bagsPerM2: 0.21 }],
+  materials: DEFAULT_MATERIALS,
   thresholds: { warn: 10, alert: 20 }, // % d'écart
   sfMaxGap: 20, // tolérance Salesforce en %
+  dateDebut: "2026-10-08", // les dossiers terminés avant cette date sont de l'historique
+  typesSuivis: ["Soufflage Combles (dont insufflation)"],
 };
 
 const ROLES = ["admin", "resp", "equipe"];
@@ -15,7 +27,7 @@ const ROLES = ["admin", "resp", "equipe"];
 // ---------- utilitaires ----------
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
-const fail = (status, message) => json({ error: message }, status);
+const fail = (status, message, code) => json({ error: message, code }, status);
 const httpError = (status, message) => Object.assign(new Error(message), { status });
 
 function secret() {
@@ -70,8 +82,11 @@ function monthsBetween(from, to) {
 }
 
 async function getConfig(store) {
-  const c = await store.get("config", { type: "json" });
-  return { ...DEFAULT_CONFIG, ...(c || {}), thresholds: { ...DEFAULT_CONFIG.thresholds, ...(c?.thresholds || {}) } };
+  const c = (await store.get("config", { type: "json" })) || {};
+  const out = { ...DEFAULT_CONFIG, ...c, thresholds: { ...DEFAULT_CONFIG.thresholds, ...(c.thresholds || {}) } };
+  // ancienne config sans codes produits → matières par défaut
+  if (!Array.isArray(c.materials) || !c.materials.some((m) => Array.isArray(m.codes) && m.codes.length)) out.materials = DEFAULT_MATERIALS;
+  return out;
 }
 async function getUsers(store) {
   return (await store.get("users", { type: "json" }))?.list || [];
@@ -81,7 +96,9 @@ function requireRole(user, ...roles) {
   if (!user) throw httpError(401, "Non connecté");
   if (!roles.includes(user.role)) throw httpError(403, "Accès non autorisé pour ce rôle");
 }
-const sameTeam = (user, ch) => norm(user.team) && norm(user.team) === norm(ch.equipe);
+// "Equipe1.iso@bci-solutions.fr", "Équipe 1", "EQUIPE 1" → "equipe1"
+const teamKey = (s) => norm(String(s ?? "").split("@")[0]).replace(/\.iso$/, "").replace(/[^a-z0-9]/g, "");
+const sameTeam = (user, ch) => !!teamKey(user.team) && teamKey(user.team) === teamKey(ch.equipe);
 
 // ---------- routes ----------
 export default async (req) => {
@@ -104,22 +121,6 @@ export default async (req) => {
       const users = await getUsers(store);
       return json({ needsSetup: users.length === 0 });
     }
-    // diagnostic technique (aucune donnée métier exposée)
-    if (r0 === "diag" && method === "GET") {
-      const out = { secretLen: (process.env.APP_SECRET || "").length };
-      try { const t = signToken({ t: 1, exp: Date.now() + 6e4 }); out.tokenRoundtrip = !!verifyToken(t); } catch (e) { out.tokenError = e.message; }
-      try {
-        const k = "diag/test";
-        await store.setJSON(k, { n: 1 });
-        const a = await store.getWithMetadata(k, { type: "json" });
-        out.etag = a?.etag;
-        const w = await store.setJSON(k, { n: 2 }, { onlyIfMatch: a.etag });
-        out.conditionalWrite = w.modified;
-        const b = await store.get(k, { type: "json" });
-        out.readBack = b?.n;
-      } catch (e) { out.blobError = e.message; }
-      return json(out);
-    }
     if (r0 === "setup" && method === "POST") {
       if (body.secret !== secret()) return fail(403, "Code d'installation incorrect");
       if (!body.login || !body.password || body.password.length < 8) return fail(400, "Identifiant et mot de passe (8 caractères min.) requis");
@@ -138,7 +139,13 @@ export default async (req) => {
       return json({ token, user: publicUser(u) });
     }
 
-    if (!user) return fail(401, "Session expirée, reconnectez-vous");
+    if (!user) return fail(401, auth ? "Session expirée ou invalide, reconnectez-vous" : "Non connecté", "AUTH");
+
+    if (r0 === "me" && method === "GET") {
+      const u = (await getUsers(store)).find((x) => x.login === user.login && x.active !== false);
+      if (!u) return fail(401, "Compte supprimé ou désactivé", "AUTH");
+      return json(publicUser(u));
+    }
 
     // --- configuration ---
     if (r0 === "config") {
@@ -146,7 +153,12 @@ export default async (req) => {
       if (method === "PUT") {
         requireRole(user, "admin");
         const c = { ...(await getConfig(store)), ...body };
-        c.materials = (c.materials || []).filter((m) => m.name).map((m) => ({ id: m.id || slug(m.name), name: m.name, bagsPerM2: num(m.bagsPerM2) || 0 }));
+        c.materials = (c.materials || []).filter((m) => m.name).map((m) => ({
+          id: m.id || slug(m.name), name: m.name, bagsPerM2: num(m.bagsPerM2) || 0, aConfirmer: !!m.aConfirmer,
+          codes: (Array.isArray(m.codes) ? m.codes : String(m.codes || "").split(",")).map((x) => String(x).trim().toUpperCase()).filter(Boolean),
+        }));
+        c.typesSuivis = (Array.isArray(c.typesSuivis) ? c.typesSuivis : []).map((x) => String(x).trim()).filter(Boolean);
+        if (!isDate(c.dateDebut)) c.dateDebut = DEFAULT_CONFIG.dateDebut;
         c.depots = (c.depots || []).map((d) => String(d).trim().toUpperCase()).filter(Boolean);
         await store.setJSON("config", c);
         return json(c);
@@ -185,39 +197,72 @@ export default async (req) => {
       }
     }
 
-    // --- import planif ---
+    // --- import planif (par paquets envoyés par le navigateur) ---
     if (r0 === "import" && method === "POST") {
       requireRole(user, "admin", "resp");
       const config = await getConfig(store);
       const rows = Array.isArray(body.rows) ? body.rows : [];
       if (!rows.length) return fail(400, "Aucune ligne à importer");
-      if (rows.length > 2000) return fail(400, "2000 lignes max. par import");
-      const batch = `${new Date().toISOString()}_${user.login}`;
-      const result = { created: 0, updated: 0, skipped: [], locked: 0 };
-      const tasks = rows.map((row, idx) => async () => {
+      if (rows.length > 300) return fail(400, "300 lignes max. par paquet");
+      const batch = body.batch || `${new Date().toISOString()}_${user.login}`;
+      const result = { created: 0, updated: 0, moved: 0, unchanged: 0, skipped: [], locked: 0 };
+      const idx = (await store.get("idx", { type: "json" })) || {};
+      const idxUpdates = {};
+      const FIELDS = ["date", "ref", "rdv", "client", "adresse", "ville", "cp", "equipe", "materiau", "produit", "rValue", "surfacePrevue", "sacsPrevus", "typeOpp", "statutSF", "etatSuivi", "dateRealSF"];
+      const sameData = (a, b) => FIELDS.every((f) => (a[f] ?? null) === (b[f] ?? null));
+      const tasks = rows.map((row, i) => async () => {
         const date = row.date;
-        if (!isDate(date)) return result.skipped.push({ ligne: idx + 1, raison: "date invalide" });
+        if (!isDate(date)) return result.skipped.push({ ligne: row.ligne || i + 1, raison: "date invalide" });
+        if (!row.client && !row.ref && !row.adresse) return result.skipped.push({ ligne: row.ligne || i + 1, raison: "ni référence, ni client, ni adresse" });
         const surface = num(row.surfacePrevue);
-        const mat = config.materials.find((m) => norm(m.name) === norm(row.materiau) || m.id === row.materiau) || config.materials[0];
+        const mat = config.materials.find((m) => m.name === row.materiau) || config.materials.find((m) => norm(m.name) === norm(row.materiau)) || config.materials[0];
         let sacs = num(row.sacsPrevus);
         if (sacs === null && surface !== null && mat) sacs = Math.ceil(surface * mat.bagsPerM2);
-        if (!row.client && !row.ref && !row.adresse) return result.skipped.push({ ligne: idx + 1, raison: "ni référence, ni client, ni adresse" });
-        const id = slug(row.ref) || slug(`${date}-${row.client}-${row.adresse}`) || crypto.randomUUID();
-        const key = `ch/${monthOf(date)}/${id}`;
+        const id = slug(row.id || row.rdv || row.ref) || slug(`${date}-${row.client}-${row.adresse}`) || crypto.randomUUID();
+        const month = monthOf(date);
         const planif = {
-          id, month: monthOf(date), date, ref: String(row.ref ?? "").trim(), client: String(row.client ?? "").trim(),
-          adresse: String(row.adresse ?? "").trim(), ville: String(row.ville ?? "").trim(), equipe: String(row.equipe ?? "").trim(),
-          materiau: mat ? mat.name : String(row.materiau ?? ""), surfacePrevue: surface, sacsPrevus: sacs,
+          id, month, date, ref: String(row.ref ?? "").trim(), rdv: String(row.rdv ?? "").trim(), client: String(row.client ?? "").trim(),
+          adresse: String(row.adresse ?? "").trim(), ville: String(row.ville ?? "").trim(), cp: String(row.cp ?? "").trim(),
+          equipe: String(row.equipe ?? "").trim(), materiau: mat ? mat.name : String(row.materiau ?? ""), produit: String(row.produit ?? "").trim(),
+          rValue: num(row.rValue), surfacePrevue: surface, sacsPrevus: sacs, typeOpp: String(row.typeOpp ?? "").trim(),
+          statutSF: String(row.statutSF ?? "").trim(), etatSuivi: String(row.etatSuivi ?? "").trim(), dateRealSF: isDate(row.dateRealSF) ? row.dateRealSF : null,
         };
+        const oldMonth = idx[id];
+        // replanifié sur un autre mois : on déplace la fiche (avec sa saisie)
+        if (oldMonth && oldMonth !== month) {
+          const old = await store.get(`ch/${oldMonth}/${id}`, { type: "json" });
+          if (old?.validation) { result.locked++; return; }
+          if (old) {
+            await store.setJSON(`ch/${month}/${id}`, { ...old, ...planif, updatedAt: new Date().toISOString(), importBatch: batch });
+            await store.delete(`ch/${oldMonth}/${id}`);
+            idxUpdates[id] = month; result.moved++; return;
+          }
+        }
+        const key = `ch/${month}/${id}`;
         await updateJSON(store, key, (cur) => {
           if (cur?.validation) { result.locked++; return undefined; }
+          if (cur && sameData(cur, planif)) { result.unchanged++; return undefined; }
           if (cur) { result.updated++; return { ...cur, ...planif, updatedAt: new Date().toISOString(), importBatch: batch }; }
           result.created++;
           return { ...planif, saisie: null, validation: null, importedAt: new Date().toISOString(), importBatch: batch };
         });
+        if (idx[id] !== month) idxUpdates[id] = month;
       });
-      for (let i = 0; i < tasks.length; i += 25) await Promise.all(tasks.slice(i, i + 25).map((t) => t()));
+      for (let i = 0; i < tasks.length; i += 20) await Promise.all(tasks.slice(i, i + 20).map((t) => t()));
+      if (Object.keys(idxUpdates).length) await updateJSON(store, "idx", (cur) => ({ ...(cur || {}), ...idxUpdates }));
       return json(result);
+    }
+
+    // --- dossiers à planifier (sans date) : remplacés à chaque import ---
+    if (r0 === "backlog") {
+      requireRole(user, "admin", "resp");
+      if (method === "GET") return json((await store.get("backlog", { type: "json" })) || { items: [], at: null });
+      if (method === "PUT") {
+        const items = (Array.isArray(body.items) ? body.items : []).slice(0, 3000);
+        const data = { items, at: new Date().toISOString(), by: user.name };
+        await store.setJSON("backlog", data);
+        return json({ ok: true, count: items.length });
+      }
     }
 
     // --- chantiers ---
@@ -232,6 +277,17 @@ export default async (req) => {
         if (user.role === "equipe") items = items.filter((c) => sameTeam(user, c));
         items.sort((a, b) => a.date.localeCompare(b.date) || a.equipe.localeCompare(b.equipe) || a.client.localeCompare(b.client));
         return json(items);
+      }
+      if (method === "DELETE" && r1 === "non-saisis") {
+        requireRole(user, "admin");
+        const keys = await listAll(store, "ch/");
+        const items = await getMany(store, keys);
+        const del = items.filter((c) => !c.saisie && !c.validation);
+        for (let i = 0; i < del.length; i += 25) await Promise.all(del.slice(i, i + 25).map((c) => store.delete(`ch/${c.month}/${c.id}`)));
+        const idx = (await store.get("idx", { type: "json" })) || {};
+        del.forEach((c) => delete idx[c.id]);
+        await store.setJSON("idx", idx);
+        return json({ deleted: del.length });
       }
       // équipes : chantiers passés non saisis (rattrapage)
       if (method === "GET" && r1 === "a-saisir") {
@@ -327,7 +383,12 @@ export default async (req) => {
         listAll(store, "ch/").then((k) => getMany(store, k)),
       ]);
       const rows = {};
-      const row = (depot, mat) => (rows[`${depot}|${mat}`] ||= {
+      const resolveMat = (x) => {
+        const k = norm(x).replace(/[^a-z0-9+]/g, "");
+        const m = config.materials.find((m) => m.name === x) || config.materials.find((m) => (m.codes || []).some((c) => k.startsWith(norm(c))));
+        return m ? m.name : x;
+      };
+      const row = (depot, matRaw, mat = resolveMat(matRaw)) => (rows[`${depot}|${mat}`] ||= {
         depot, materiau: mat, entrees: 0, souffleTotal: 0, souffleValide: 0, souffleNonValide: 0, declareValide: 0,
         nbChantiers: 0, inventaire: null,
       });
@@ -349,10 +410,10 @@ export default async (req) => {
         r.officiel = r.entrees - r.declareValide - r.souffleNonValide;
         r.stock2 = r.declareValide - r.souffleValide;
         r.physique = r.entrees - r.souffleTotal;
-        const last = invs.filter((i) => i.depot === r.depot && i.materiau === r.materiau).sort((a, b) => b.date.localeCompare(a.date) || b.at.localeCompare(a.at))[0];
+        const last = invs.filter((i) => i.depot === r.depot && resolveMat(i.materiau) === r.materiau).sort((a, b) => b.date.localeCompare(a.date) || b.at.localeCompare(a.at))[0];
         if (last) {
-          const entreesAt = mvs.filter((m) => m.type !== "inventaire" && m.depot === r.depot && m.materiau === r.materiau && m.date <= last.date).reduce((s, m) => s + m.qty, 0);
-          const souffleAt = chs.filter((c) => c.saisie && c.saisie.depot === r.depot && c.materiau === r.materiau && c.date <= last.date).reduce((s, c) => s + (c.saisie.sacsSouffles || 0), 0);
+          const entreesAt = mvs.filter((m) => m.type !== "inventaire" && m.depot === r.depot && resolveMat(m.materiau) === r.materiau && m.date <= last.date).reduce((s, m) => s + m.qty, 0);
+          const souffleAt = chs.filter((c) => c.saisie && c.saisie.depot === r.depot && resolveMat(c.materiau) === r.materiau && c.date <= last.date).reduce((s, c) => s + (c.saisie.sacsSouffles || 0), 0);
           const theorique = entreesAt - souffleAt;
           r.inventaire = { date: last.date, compte: last.qty, theorique, ecart: last.qty - theorique };
         }

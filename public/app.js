@@ -3,10 +3,16 @@ const $ = (s, el = document) => el.querySelector(s);
 const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const app = $("#app");
 
+// Stockage navigateur avec repli : localStorage → sessionStorage → mémoire (navigation privée, iPhone restreint…)
+const memStore = {};
+const backends = [() => localStorage, () => sessionStorage];
+function usable(f) { try { const s = f(); s.setItem("__t", "1"); s.removeItem("__t"); return s; } catch { return null; } }
+const persist = usable(backends[0]) || usable(backends[1]);
 const store = {
-  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
-  del(k) { try { localStorage.removeItem(k); } catch {} },
+  persistent: !!persist,
+  get(k) { try { const v = persist ? persist.getItem(k) : memStore[k]; return v == null ? null : JSON.parse(v); } catch { return null; } },
+  set(k, v) { const j = JSON.stringify(v); try { if (persist) persist.setItem(k, j); else memStore[k] = j; } catch { memStore[k] = j; } },
+  del(k) { try { if (persist) persist.removeItem(k); } catch {} delete memStore[k]; },
 };
 
 const S = { token: store.get("ss_token"), user: store.get("ss_user"), config: null };
@@ -37,12 +43,16 @@ async function api(path, opts = {}) {
   if (body && !(body instanceof Blob) && typeof body !== "string") { headers["content-type"] = "application/json"; body = JSON.stringify(body); }
   const r = await fetch(`/api/${path}`, { method: opts.method || "GET", headers, body });
   const data = await r.json().catch(() => ({}));
-  if (r.status === 401 && path !== "login" && path !== "setup") { logout(); throw new Error(data.error || "Session expirée"); }
+  if (r.status === 401 && data.code === "AUTH" && path !== "login" && path !== "setup") { logout(data.error); throw new Error(data.error || "Session expirée"); }
   if (!r.ok) throw new Error(data.error || `Erreur ${r.status}`);
   return data;
 }
 
-function logout() { S.token = null; S.user = null; store.del("ss_token"); store.del("ss_user"); location.hash = "#/"; render(); }
+function logout(reason) {
+  S.token = null; S.user = null; S.config = null; store.del("ss_token"); store.del("ss_user");
+  if (typeof reason === "string" && reason) setTimeout(() => toast(reason, true), 50);
+  location.hash = "#/"; render();
+}
 
 // ---------- calculs métier ----------
 // Statut, indicateurs et alertes d'un chantier
@@ -122,12 +132,14 @@ function renderNav() {
   const cur = "#/" + (location.hash.replace(/^#\/?/, "").split("/")[0] || "");
   $("#nav").innerHTML = links.map(([h, l]) => `<a href="${h}" class="${h === cur ? "active" : ""}">${l}</a>`).join("");
 }
-$("#logoutBtn").onclick = logout;
+$("#logoutBtn").onclick = () => logout();
 
 async function render() {
+  const rid = (S.rid = (S.rid || 0) + 1);
   renderNav();
   try {
     if (!S.user) return await viewLogin();
+    if (!S.checked) { S.checked = true; S.user = await api("me"); store.set("ss_user", S.user); renderNav(); }
     if (!S.config) S.config = await api("config");
     const [r, a, b] = location.hash.replace(/^#\/?/, "").split("/");
     if (r === "saisie") return await viewSaisie(a, b);
@@ -139,6 +151,7 @@ async function render() {
     if (r === "params" && isAdmin()) return await viewParams();
     return await viewDashboard();
   } catch (e) {
+    if (rid !== S.rid) return; // une autre page a été ouverte entre-temps : on ignore l'ancienne
     app.innerHTML = `<div class="card"><h3>Erreur</h3><p>${esc(e.message)}</p><button class="btn-secondary" onclick="location.reload()">Recharger</button></div>`;
   }
 }
@@ -169,12 +182,13 @@ async function viewLogin() {
       <div class="field"><label>Identifiant</label><input name="login" required autocapitalize="off" autocomplete="username"></div>
       <div class="field"><label>Mot de passe</label><input name="password" type="password" required autocomplete="current-password"></div>
       <button class="block">Se connecter</button>
+      ${store.persistent ? "" : `<p class="hint">Ce navigateur bloque l'enregistrement de session (navigation privée ?) : il faudra se reconnecter à chaque ouverture.</p>`}
     </form></div>`;
   $("#f").onsubmit = async (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(e.target)); try { await doLogin(d.login, d.password); } catch (err) { toast(err.message, true); } };
 }
 async function doLogin(login, password) {
   const r = await api("login", { method: "POST", body: { login, password } });
-  S.token = r.token; S.user = r.user; store.set("ss_token", r.token); store.set("ss_user", r.user);
+  S.token = r.token; S.user = r.user; S.checked = true; store.set("ss_token", r.token); store.set("ss_user", r.user);
   location.hash = "#/"; render();
 }
 
@@ -199,10 +213,10 @@ async function viewEquipeHome() {
 }
 function jobCard(c) {
   const m = calc(c);
-  const info = c.saisie ? `${n0(c.saisie.sacsSouffles)} sacs soufflés · ${n0(c.saisie.surfaceMesuree)} m²` : `Prévu : ${n0(c.sacsPrevus)} sacs · ${n0(c.surfacePrevue)} m²`;
+  const info = c.saisie ? `${n0(c.saisie.sacsSouffles)} sacs soufflés · ${n0(c.saisie.surfaceMesuree)} m²` : `Prévu : ${n0(c.sacsPrevus)} sacs · ${n0(c.surfacePrevue)} m²${c.produit ? ` · ${esc(c.produit)}` : ""}`;
   return `<a class="job st-${m.status}" href="#/saisie/${c.month}/${encodeURIComponent(c.id)}">
     <div class="row"><span class="t">${esc(c.client || c.ref)}</span><span class="spacer"></span>${statusBadge(m.status)}</div>
-    <div class="s">${esc([c.adresse, c.ville].filter(Boolean).join(", "))}${c.ref ? ` · ${esc(c.ref)}` : ""}</div>
+    <div class="s">${esc([c.adresse, c.ville, c.cp].filter(Boolean).join(" "))}${c.ref ? ` · ${esc(c.ref)}` : ""}</div>
     <div class="s">${fmtDate(c.date)} · ${info}</div></a>`;
 }
 
@@ -298,7 +312,7 @@ async function loadPhotos(root) {
 }
 
 // ---------- tableau de bord responsable ----------
-const DASH = store.get("ss_dash") || { from: addDays(today(), -6), to: today(), equipe: "", statut: "", niveau: "", q: "", sort: "niveau", dir: -1 };
+const DASH = { from: addDays(today(), -7), to: addDays(today(), 14), equipe: "", statut: "", niveau: "", q: "", sort: "date", dir: 1, ...(store.get("ss_dash2") || {}) };
 async function viewDashboard() {
   app.innerHTML = `<div class="row"><h1>Tableau de bord</h1><span class="spacer"></span><button class="btn-secondary sm" id="csv">Exporter CSV</button></div>
     <div class="filters">
@@ -309,12 +323,12 @@ async function viewDashboard() {
       <div class="field"><label>Alerte</label><select id="niveau"><option value="">Toutes</option><option value="red">Rouge</option><option value="orange">Orange et +</option><option value="green">Vert</option></select></div>
       <div class="field"><label>Recherche</label><input id="q" placeholder="Client, réf., ville" value="${esc(DASH.q)}"></div>
     </div>
-    <div class="tabs" id="quick"><button data-r="0">Aujourd'hui</button><button data-r="1">Hier</button><button data-r="7">7 jours</button><button data-r="30">30 jours</button><button data-r="month">Ce mois</button></div>
+    <div class="tabs" id="quick"><button data-r="0">Aujourd'hui</button><button data-r="1">Hier</button><button data-r="7">7 derniers jours</button><button data-r="next">À venir (14 j)</button><button data-r="both">−7 j / +14 j</button><button data-r="month">Ce mois</button></div>
     <div id="kpis" class="kpis"></div><div id="table"><p class="muted">Chargement…</p></div>`;
   ["statut", "niveau"].forEach((k) => ($("#" + k).value = DASH[k]));
   let items = [];
   const load = async () => {
-    DASH.from = $("#from").value; DASH.to = $("#to").value; store.set("ss_dash", DASH);
+    DASH.from = $("#from").value; DASH.to = $("#to").value; store.set("ss_dash2", DASH);
     $("#table").innerHTML = `<p class="muted">Chargement…</p>`;
     items = (await api(`chantiers?from=${DASH.from}&to=${DASH.to}`)).map((c) => ({ ...c, m: calc(c) }));
     const teams = [...new Set(items.map((c) => c.equipe).filter(Boolean))].sort();
@@ -363,15 +377,17 @@ async function viewDashboard() {
         <td class="num">${n0(sum((c) => c.sacsPrevus))}</td><td class="num">${n0(sum((c) => c.saisie?.sacsCharges))}</td><td class="num">${n0(soufSaisis)}</td><td></td><td></td>
         <td class="num">${n0(sum((c) => c.validation?.sacsDeclares))}</td><td class="num">${n0(sum((c) => c.m.retourOfficiel))}</td><td class="num">${n0(sum((c) => c.m.stock2))}</td><td></td></tr></tfoot></table></div>
       <p class="muted small">Survolez une ligne pour voir ses alertes. Retour officiel = prévu − déclaré SF ; Stock 2 = déclaré SF − soufflé.</p>`;
-    $$("th.sortable").forEach((th) => (th.onclick = () => { if (DASH.sort === th.dataset.k) DASH.dir *= -1; else { DASH.sort = th.dataset.k; DASH.dir = th.dataset.k === "niveau" ? -1 : 1; } store.set("ss_dash", DASH); draw(); }));
+    $$("th.sortable").forEach((th) => (th.onclick = () => { if (DASH.sort === th.dataset.k) DASH.dir *= -1; else { DASH.sort = th.dataset.k; DASH.dir = th.dataset.k === "niveau" ? -1 : 1; } store.set("ss_dash2", DASH); draw(); }));
     $$("tr[data-href]").forEach((tr) => (tr.onclick = () => (location.hash = tr.dataset.href)));
   }
   $("#from").onchange = load; $("#to").onchange = load;
-  ["equipe", "statut", "niveau"].forEach((k) => ($("#" + k).onchange = (e) => { DASH[k] = e.target.value; store.set("ss_dash", DASH); draw(); }));
+  ["equipe", "statut", "niveau"].forEach((k) => ($("#" + k).onchange = (e) => { DASH[k] = e.target.value; store.set("ss_dash2", DASH); draw(); }));
   $("#q").oninput = (e) => { DASH.q = e.target.value; draw(); };
   $$("#quick button").forEach((b) => (b.onclick = () => {
     const r = b.dataset.r, t = today();
-    if (r === "month") { $("#from").value = t.slice(0, 8) + "01"; $("#to").value = t; }
+    if (r === "month") { $("#from").value = t.slice(0, 8) + "01"; $("#to").value = addDays(addDays(t.slice(0, 8) + "28", 4).slice(0, 8) + "01", -1); }
+    else if (r === "next") { $("#from").value = t; $("#to").value = addDays(t, 14); }
+    else if (r === "both") { $("#from").value = addDays(t, -7); $("#to").value = addDays(t, 14); }
     else if (r === "1") { $("#from").value = $("#to").value = addDays(t, -1); }
     else { $("#from").value = addDays(t, -(+r === 0 ? 0 : +r - 1)); $("#to").value = t; }
     load();
@@ -483,8 +499,8 @@ const FIELDS = [
 ];
 function viewImport() {
   const cfg = S.config;
-  app.innerHTML = `<h1>Import de la planif</h1>
-    <p class="muted small">Déposez l'extraction (Excel ou CSV). Vous associez les colonnes une seule fois, l'association est ensuite mémorisée. Un chantier déjà importé est mis à jour sans toucher à la saisie de l'équipe. Un chantier validé n'est jamais modifié.</p>
+  app.innerHTML = `<p class="kicker">Planification</p><h1>Import de la planif</h1>
+    <p class="muted small">Déposez l'export Salesforce tel quel (.xls, .xlsx ou .csv) : l'appli le reconnaît et trie seule les types d'opportunité, l'historique, les annulés, la planif datée et les dossiers à planifier. Vous pouvez réimporter chaque jour : un chantier déjà importé est mis à jour (y compris s'il est replanifié) sans toucher à la saisie de l'équipe, et un chantier validé n'est jamais modifié.</p>
     <div class="card"><div class="inline-fields">
       <div class="field" style="flex:2 1 260px"><label>Fichier</label><input type="file" id="file" accept=".xlsx,.xls,.csv"></div>
       <div class="field"><label>Date par défaut (si pas de colonne date)</label><input type="date" id="defDate" value="${addDays(today(), 1)}"></div>
@@ -508,6 +524,13 @@ function viewImport() {
     if (hi < 0) return toast("Aucune ligne d'en-tête trouvée", true);
     headers = raw[hi].map((h, i) => String(h).trim() || `Colonne ${i + 1}`);
     rows = raw.slice(hi + 1).filter((r) => r.some((x) => String(x).trim()));
+    if (isSalesforce(headers)) {
+      // relecture sans conversion de dates : Salesforce exporte en heure UTC, on convertit nous-mêmes en heure de Paris
+      const raw2 = /\.csv$/i.test(file.name) ? raw : XLSX.utils.sheet_to_json(XLSX.read(buf, { type: "array" }).Sheets[wb.SheetNames[0]], { header: 1, defval: "", raw: true });
+      $("#map").innerHTML = "";
+      ["#defDate", "#defMat"].forEach((q) => ($(q).closest(".field").hidden = true));
+      return viewSalesforceImport(headers, raw2.slice(hi + 1).filter((r) => r.some((x) => String(x).trim())), file.name);
+    }
     const sig = norm(headers.join("|"));
     const saved = (store.get("ss_maps") || {})[sig];
     const mapping = {};
@@ -547,7 +570,12 @@ function viewImport() {
         const maps = store.get("ss_maps") || {}; maps[sig] = mapping; store.set("ss_maps", maps);
         $("#go").disabled = true; $("#go").textContent = "Import en cours…";
         try {
-          const r = await api("import", { method: "POST", body: { rows: data.filter((d) => d.date) } });
+          const todo = data.filter((d) => d.date), r = { created: 0, updated: 0, moved: 0, locked: 0, skipped: [] };
+          for (let i = 0; i < todo.length; i += 120) {
+            const x = await api("import", { method: "POST", body: { rows: todo.slice(i, i + 120) } });
+            for (const k of ["created", "updated", "moved", "locked"]) r[k] += x[k] || 0;
+            r.skipped.push(...(x.skipped || []));
+          }
           $("#preview").innerHTML = `<div class="card"><h3>Import terminé</h3><p>${r.created} créé(s), ${r.updated} mis à jour${r.locked ? `, ${r.locked} déjà validé(s) non modifié(s)` : ""}${r.skipped.length ? `, ${r.skipped.length} ignoré(s)` : ""}.</p>
             ${r.skipped.length ? `<p class="small muted">${r.skipped.slice(0, 10).map((s) => `ligne ${s.ligne} : ${esc(s.raison)}`).join(" · ")}</p>` : ""}<a class="btn" href="#/">Voir le tableau de bord</a></div>`;
           $("#map").innerHTML = ""; $("#file").value = "";
@@ -557,6 +585,131 @@ function viewImport() {
     preview();
   };
 }
+// ---------- import Salesforce (export « Export Global … ») ----------
+const isSalesforce = (h) => { const n = h.map(norm); return n.includes(norm("Type d'opportunité-travail")) && n.includes(norm("Produit à Poser")) && n.some((x) => x.startsWith("numero de rendez-vous")); };
+const parisFmt = new Intl.DateTimeFormat("fr-CA", { timeZone: "Europe/Paris", year: "numeric", month: "2-digit", day: "2-digit" });
+function sfDate(v) {
+  if (v === "" || v === null || v === undefined) return null;
+  if (typeof v === "number") return v > 20000 && v < 90000 ? parisFmt.format(new Date(Math.round((v - 25569) * 864e5))) : null;
+  if (v instanceof Date) return parisFmt.format(v);
+  return parseDate(v);
+}
+function parseProduit(p, materials) {
+  const raw = String(p || "").toUpperCase().replace(/^FORFAIT\s+/, "").split("/")[0].replace(/\s+/g, "");
+  const m = raw.match(/^(.*?)R(\d+(?:[.,]\d+)?)$/);
+  const code = m ? m[1] : raw;
+  const R = m ? Number(m[2].replace(",", ".")) : null;
+  const mat = code ? materials.find((x) => (x.codes || []).some((c) => code.startsWith(c))) : null;
+  return { raw, code, R, mat };
+}
+const teamLabel = (s) => { const v = String(s || "").trim(); if (!v) return ""; const m = v.match(/equipe\s*(\d+)/i); return m ? `Equipe ${m[1]}` : v.split("@")[0]; };
+
+function classifySalesforce(headers, rows, cfg) {
+  const ix = {}; headers.forEach((h, i) => (ix[norm(h)] ||= []).push(i));
+  const col = (name, n = 0) => (ix[norm(name)] || [])[n];
+  const C = {
+    compte: col("Nom du compte: Nom du compte"), activite: col("Activité du compte"), clientFinal: col("Nom du Client final"), devis: col("Devis: Nom du devis"),
+    cp: col("Code postal d'expédition"), commande: col("Numéro de commande"), etat: col("Etat de suivi"), surface: col("Somme quantité quantifiable"),
+    statutOE: col("Statut des ordres d'exécutions"), dateReal: col("Date de réalisation chantier"), dateReal2: col("Date de réalisation"), rdv: col("Numéro de rendez-vous"),
+    debut: col("Début planifié"), statutRdv: col("Statut", 1), produit: col("Produit à Poser"), ressource: col("Ressource de service: Nom"), type: col("Type d'opportunité-travail"),
+    dateCmd: col("Date de début de la commande"),
+  };
+  const g = (r, k) => (C[k] === undefined ? "" : r[C[k]]);
+  const types = (cfg.typesSuivis || []).map(norm);
+  const out = { autreType: {}, historique: [], annule: [], planif: [], aPlanifier: [], produitsInconnus: {}, total: rows.length };
+  const seen = new Set();
+  rows.forEach((r, i) => {
+    const typeOpp = String(g(r, "type")).trim();
+    if (!types.includes(norm(typeOpp))) { out.autreType[typeOpp || "(vide)"] = (out.autreType[typeOpp || "(vide)"] || 0) + 1; return; }
+    const statutRdv = String(g(r, "statutRdv")).trim(), etat = String(g(r, "etat")).trim(), statutOE = String(g(r, "statutOE")).trim();
+    const datePl = sfDate(g(r, "debut")), dateReal = sfDate(g(r, "dateReal")) || sfDate(g(r, "dateReal2"));
+    const devis = String(g(r, "devis"));
+    const villeM = devis.match(/-(\d{2,3})-([^-]+?)(?:-|$)/);
+    const prod = parseProduit(g(r, "produit"), cfg.materials);
+    const surface = num(g(r, "surface"));
+    const R = prod.R || 7;
+    const sacs = surface && prod.mat ? Math.ceil(surface * prod.mat.bagsPerM2 * R / 7) : surface ? Math.ceil(surface * (cfg.materials[0]?.bagsPerM2 || 0.21) * R / 7) : null;
+    const commande = String(g(r, "commande")).trim(), rdv = String(g(r, "rdv")).trim();
+    let id = rdv || commande;
+    if (seen.has(id)) id = `${commande}-${prod.raw || i}`;
+    seen.add(id);
+    const item = {
+      ligne: i + 2, id, ref: commande, rdv, client: String(/^(maison|)$/i.test(String(g(r, "clientFinal")).trim()) ? g(r, "compte") : g(r, "clientFinal")).trim(), compte: String(g(r, "compte")).trim(),
+      ville: villeM ? villeM[2].trim() : "", cp: String(g(r, "cp")).trim(), adresse: "", equipe: teamLabel(g(r, "ressource")),
+      materiau: prod.mat ? prod.mat.name : (cfg.materials[0]?.name || ""), produit: String(g(r, "produit")).trim(), rValue: R, matConnue: !!prod.mat,
+      surfacePrevue: surface, sacsPrevus: sacs, typeOpp, statutSF: statutRdv || statutOE, etatSuivi: etat, dateRealSF: dateReal, dateCommande: sfDate(g(r, "dateCmd")),
+      date: datePl || dateReal,
+    };
+    if (/annul/i.test(statutRdv) || /annulation/i.test(etat)) return out.annule.push(item);
+    if (item.date && item.date < cfg.dateDebut) return out.historique.push(item);
+    if (!prod.mat) { const k = item.produit ? prod.code || item.produit : "(produit vide)"; out.produitsInconnus[k] = (out.produitsInconnus[k] || 0) + 1; }
+    if (item.date) out.planif.push(item); else out.aPlanifier.push(item);
+  });
+  out.planif.sort((a, b) => a.date.localeCompare(b.date));
+  return out;
+}
+
+function viewSalesforceImport(headers, rows, fileName) {
+  const cfg = S.config;
+  const c = classifySalesforce(headers, rows, cfg);
+  const t = today();
+  const passes = c.planif.filter((x) => x.date < t), avenir = c.planif.filter((x) => x.date >= t);
+  const sansEquipe = c.planif.filter((x) => !x.equipe).length;
+  const sansSurface = [...c.planif, ...c.aPlanifier].filter((x) => !x.surfacePrevue).length;
+  const sum = (a, k) => a.reduce((s, x) => s + (x[k] || 0), 0);
+  const autres = Object.entries(c.autreType).sort((a, b) => b[1] - a[1]);
+  const inconnus = Object.entries(c.produitsInconnus);
+  const teams = [...new Set(c.planif.map((x) => x.equipe).filter(Boolean))].sort();
+  const aConfirmer = [...new Set([...c.planif, ...c.aPlanifier].map((x) => cfg.materials.find((m) => m.name === x.materiau)).filter((m) => m && m.aConfirmer).map((m) => m.name))];
+  $("#preview").innerHTML = `<h2>Export Salesforce reconnu <span class="muted small">(${esc(fileName)} · ${c.total} lignes)</span></h2>
+    <div class="kpis">
+      <div class="kpi dark"><div class="v">${c.planif.length}</div><div class="l">chantiers datés à suivre (${passes.length} depuis le ${fmtDate(cfg.dateDebut)}, ${avenir.length} à venir)</div></div>
+      <div class="kpi"><div class="v">${c.aPlanifier.length}</div><div class="l">à planifier (sans date) → besoins à venir</div></div>
+      <div class="kpi"><div class="v">${c.historique.length}</div><div class="l">historique (avant le ${fmtDate(cfg.dateDebut)}) ignoré</div></div>
+      <div class="kpi"><div class="v">${c.annule.length}</div><div class="l">annulés ignorés</div></div>
+      <div class="kpi"><div class="v">${autres.reduce((s, x) => s + x[1], 0)}</div><div class="l">autres types d'opportunité ignorés</div></div>
+      <div class="kpi"><div class="v">${n0(sum(c.planif, "sacsPrevus"))}</div><div class="l">sacs prévus sur les chantiers datés</div></div>
+    </div>
+    ${inconnus.length ? `<ul class="alerts-list"><li class="red">Produits non reconnus (matière par défaut appliquée) : ${inconnus.map(([k, v]) => `${esc(k)} (${v})`).join(", ")}. Ajoutez leur code dans Paramètres → Matières.</li></ul>` : ""}
+    ${aConfirmer.length ? `<ul class="alerts-list"><li class="orange">Rendement sacs/m² à confirmer pour : ${aConfirmer.map(esc).join(", ")} (0,21 appliqué par défaut). À régler dans Paramètres → Matières.</li></ul>` : ""}
+    ${sansEquipe ? `<ul class="alerts-list"><li class="orange">${sansEquipe} chantier(s) daté(s) sans équipe affectée dans Salesforce : visibles par les responsables, pas par les équipes.</li></ul>` : ""}
+    ${sansSurface ? `<ul class="alerts-list"><li class="orange">${sansSurface} dossier(s) sans surface : sacs prévus non calculés.</li></ul>` : ""}
+    <p class="small">Équipes détectées : <b>${esc(teams.join(", ") || "aucune")}</b>. Les comptes équipe se rattachent automatiquement (« Equipe 1 » = Equipe1.iso@…).</p>
+    <details class="small" style="margin-bottom:12px"><summary>Types d'opportunité ignorés</summary>${autres.map(([k, v]) => `${esc(k)} : ${v}`).join("<br>")}</details>
+    <div class="table-wrap"><table><thead><tr><th>Date</th><th>Équipe</th><th>Chantier</th><th>Statut SF</th><th>Produit</th><th class="num">m²</th><th class="num">Sacs prévus</th></tr></thead><tbody>
+      ${avenir.slice(0, 15).map((d) => `<tr><td class="nw">${fmtDate(d.date)}</td><td class="nw">${esc(d.equipe || "–")}</td><td><b>${esc(d.client)}</b><div class="muted small">${esc(d.ref)} · ${esc(d.ville)} ${esc(d.cp)}</div></td><td>${esc(d.statutSF)}</td><td>${esc(d.produit)}</td><td class="num">${n0(d.surfacePrevue)}</td><td class="num">${n0(d.sacsPrevus)}</td></tr>`).join("") || `<tr><td colspan="7" class="muted">Aucun chantier à venir dans ce fichier.</td></tr>`}
+    </tbody></table></div><p class="muted small">Aperçu des 15 prochains chantiers.</p>
+    <div class="card" style="margin-top:12px"><div class="row"><button id="go">Importer ${c.planif.length} chantiers + ${c.aPlanifier.length} à planifier</button><span id="prog" class="muted small"></span></div>
+    <div class="bar" style="margin-top:10px"><i id="progbar" style="width:0"></i></div></div>`;
+  $("#go").onclick = async () => {
+    const btn = $("#go"); btn.disabled = true;
+    const batch = `${new Date().toISOString()}_${S.user.login}`;
+    const tot = { created: 0, updated: 0, moved: 0, unchanged: 0, locked: 0, skipped: [] };
+    const chunks = []; for (let i = 0; i < c.planif.length; i += 120) chunks.push(c.planif.slice(i, i + 120));
+    try {
+      for (let k = 0; k < chunks.length; k++) {
+        $("#prog").textContent = `Paquet ${k + 1}/${chunks.length}…`;
+        let r;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try { r = await api("import", { method: "POST", body: { rows: chunks[k], batch } }); break; }
+          catch (err) { if (attempt === 2) throw err; await new Promise((res) => setTimeout(res, 1500)); }
+        }
+        for (const key of ["created", "updated", "moved", "unchanged", "locked"]) tot[key] += r[key] || 0;
+        tot.skipped.push(...(r.skipped || []));
+        $("#progbar").style.width = `${Math.round(((k + 1) / (chunks.length + 1)) * 100)}%`;
+      }
+      $("#prog").textContent = "Mise à jour des dossiers à planifier…";
+      await api("backlog", { method: "PUT", body: { items: c.aPlanifier.map(({ ligne, ...x }) => x) } });
+      $("#progbar").style.width = "100%";
+      $("#preview").innerHTML = `<div class="card"><h3>Import terminé</h3>
+        <p><b>${tot.created}</b> nouveaux chantiers, <b>${tot.updated}</b> mis à jour, <b>${tot.moved}</b> replanifiés, ${tot.unchanged} inchangés${tot.locked ? `, ${tot.locked} validés non modifiés` : ""}${tot.skipped.length ? `, ${tot.skipped.length} ignorés` : ""}.</p>
+        <p>${c.aPlanifier.length} dossiers à planifier enregistrés pour le calcul des besoins.</p>
+        <div class="row"><a class="btn" href="#/">Voir le tableau de bord</a><a class="btn btn-secondary" href="#/stock">Voir les besoins en sacs</a></div></div>`;
+      $("#map").innerHTML = ""; $("#file").value = "";
+    } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = "Réessayer l'import (les paquets déjà passés ne seront pas dupliqués)"; }
+  };
+}
+
 function parseDate(v) {
   if (!v && v !== 0) return null;
   if (v instanceof Date && !isNaN(v)) return new Date(v.getTime() - v.getTimezoneOffset() * 6e4).toISOString().slice(0, 10);
@@ -572,6 +725,8 @@ async function viewStock() {
   const cfg = S.config;
   app.innerHTML = `<h1>Stock</h1><p class="muted small">Stock officiel = entrées − déclaré Salesforce (chantiers validés) − soufflé (chantiers saisis non encore validés). Stock 2 = déclaré − soufflé. Stock physique théorique = officiel + stock 2 = entrées − soufflé. Les sorties sont imputées au dépôt de départ indiqué par l'équipe.</p>
     <div id="stk"><p class="muted">Chargement…</p></div>
+    <h2>Besoins à venir</h2><p class="muted small">Sacs prévus sur les chantiers planifiés non encore saisis (60 prochains jours) et sur les dossiers Salesforce encore à planifier — pour passer la commande mensuelle avant le 10.</p>
+    <div id="besoins"><p class="muted">Chargement…</p></div>
     <h2>Saisir un mouvement</h2>
     <form class="card" id="mf"><div class="inline-fields">
       <div class="field"><label>Type</label><select name="type"><option value="livraison">Livraison</option><option value="initial">Stock initial</option><option value="inventaire">Inventaire (comptage)</option><option value="ajustement">Ajustement (+/−)</option></select></div>
@@ -583,7 +738,16 @@ async function viewStock() {
       <button>Enregistrer</button></div></form>
     <h2>Historique des mouvements</h2><div id="mvs"></div>`;
   const load = async () => {
-    const [stock, mvs] = await Promise.all([api("stock"), api("mouvements")]);
+    const [stock, mvs, futurs, backlog] = await Promise.all([api("stock"), api("mouvements"), api(`chantiers?from=${today()}&to=${addDays(today(), 60)}`), api("backlog")]);
+    const bes = {};
+    const b = (m) => (bes[m] ||= { m, nPl: 0, sPl: 0, nAp: 0, sAp: 0 });
+    futurs.filter((c) => !c.saisie).forEach((c) => { const r = b(c.materiau); r.nPl++; r.sPl += c.sacsPrevus || 0; });
+    (backlog.items || []).forEach((c) => { const r = b(c.materiau); r.nAp++; r.sAp += c.sacsPrevus || 0; });
+    const phys = (m) => stock.filter((r) => r.materiau === m).reduce((s, r) => s + r.physique, 0);
+    const rowsB = Object.values(bes).sort((x, y) => (y.sPl + y.sAp) - (x.sPl + x.sAp));
+    $("#besoins").innerHTML = rowsB.length ? `<div class="table-wrap"><table><thead><tr><th>Matière</th><th class="num">Chantiers planifiés</th><th class="num">Sacs planifiés</th><th class="num">Dossiers à planifier</th><th class="num">Sacs à planifier</th><th class="num">Besoin total</th><th class="num">Stock physique</th><th class="num">Manque</th></tr></thead><tbody>
+      ${rowsB.map((r) => { const tot = r.sPl + r.sAp, ph = phys(r.m), manque = Math.max(0, tot - ph); return `<tr><td><b>${esc(r.m)}</b></td><td class="num">${r.nPl}</td><td class="num">${n0(r.sPl)}</td><td class="num">${r.nAp}</td><td class="num">${n0(r.sAp)}</td><td class="num"><b>${n0(tot)}</b></td><td class="num">${n0(ph)}</td><td class="num ${manque ? "pos" : ""}">${manque ? n0(manque) : "–"}</td></tr>`; }).join("")}
+      </tbody></table></div><p class="muted small">Dossiers à planifier mis à jour le ${backlog.at ? fmtDateTime(backlog.at) : "–"} (dernier import Salesforce).</p>` : `<p class="muted">Aucun besoin : importez la planif Salesforce.</p>`;
     const tot = (k) => stock.reduce((s, r) => s + (r[k] || 0), 0);
     $("#stk").innerHTML = `<div class="kpis"><div class="kpi"><div class="v">${n0(tot("officiel"))}</div><div class="l">stock officiel total</div></div>
       <div class="kpi ${tot("stock2") ? "warn" : ""}"><div class="v">${n0(tot("stock2"))}</div><div class="l">stock 2 total</div></div>
@@ -634,12 +798,21 @@ async function viewParams() {
         <div class="field"><label>Tolérance Salesforce (± %)</label><input name="sfMaxGap" inputmode="numeric" value="${cfg.sfMaxGap}"></div>
       </div>
       <div class="field" style="margin-top:12px"><label>Dépôts (séparés par des virgules)</label><input name="depots" value="${esc(cfg.depots.join(", "))}"></div>
-      <h3 style="margin-top:16px">Matières — rendement pour R7 complet (sacs par m²)</h3>
+      <h3 style="margin-top:16px">Import Salesforce</h3>
+      <div class="inline-fields">
+        <div class="field"><label>Date de démarrage du suivi (avant = historique)</label><input type="date" name="dateDebut" value="${esc(cfg.dateDebut || "")}"></div>
+        <div class="field" style="flex:2 1 300px"><label>Types d'opportunité suivis (un par ligne)</label><textarea name="typesSuivis" rows="2">${esc((cfg.typesSuivis || []).join("\n"))}</textarea></div>
+      </div>
+      <h3 style="margin-top:16px">Matières — rendement pour R7 (sacs par m²) et codes produit Salesforce</h3>
+      <p class="muted small">Le code produit Salesforce donne la matière et le R : SUPAR7 → code SUPA, R7. Sacs prévus = surface × rendement R7 × R ÷ 7, arrondi au sac supérieur.</p>
       <div id="mats">${cfg.materials.map((m) => matRow(m)).join("")}</div>
       <p><button type="button" class="btn-secondary sm" id="addMat">+ Matière</button></p>
-      <p class="muted small">Exemple : 21 sacs pour 100 m² = 0,21. Les sacs prévus sont calculés ainsi quand la planif ne les fournit pas (arrondi au sac supérieur).</p>
+      <p class="muted small">Exemple : 21 sacs pour 100 m² en R7 = 0,21. Une matière marquée « à confirmer » s'affiche en alerte à l'import tant que son rendement n'est pas validé.</p>
       <button>Enregistrer les règles</button>
-    </form>`;
+    </form>
+    <h2>Maintenance</h2>
+    <div class="card"><p class="small">Repartir propre : supprime tous les chantiers importés <b>qui n'ont pas encore de saisie équipe</b>. Les chantiers saisis ou validés, le stock et les comptes ne sont pas touchés. Réimportez ensuite l'export Salesforce.</p>
+    <button type="button" class="btn-danger" id="purge">Vider les chantiers non saisis</button></div>`;
   api(`chantiers?from=${addDays(today(), -60)}&to=${addDays(today(), 30)}`).then((items) => { $("#teamList").innerHTML = [...new Set(items.map((c) => c.equipe).filter(Boolean))].map((t) => `<option value="${esc(t)}">`).join(""); }).catch(() => {});
   const uf = $("#uf");
   const reset = () => { uf.reset(); uf.login.readOnly = false; $("#ufTitle").textContent = "Nouveau compte"; $("#pwHint").textContent = "(6 caract. min.)"; };
@@ -655,6 +828,10 @@ async function viewParams() {
     const d = Object.fromEntries(new FormData(uf)); d.active = uf.active.checked;
     try { await api("users", { method: "POST", body: d }); toast("Compte enregistré"); render(); } catch (err) { toast(err.message, true); }
   };
+  $("#purge").onclick = async () => {
+    if (!confirm("Supprimer tous les chantiers importés non saisis ? Les saisies, validations et le stock sont conservés.")) return;
+    try { const r = await api("chantiers/non-saisis", { method: "DELETE" }); toast(`${r.deleted} chantiers supprimés`); } catch (err) { toast(err.message, true); }
+  };
   $("#addMat").onclick = () => $("#mats").insertAdjacentHTML("beforeend", matRow({ name: "", bagsPerM2: "" }));
   $("#mats").onclick = (e) => { if (e.target.matches("[data-rm]")) e.target.closest(".inline-fields").remove(); };
   $("#cf").onsubmit = async (e) => {
@@ -662,12 +839,13 @@ async function viewParams() {
     const body = {
       targetCm: num(f.targetCm.value), thresholds: { warn: num(f.warn.value), alert: num(f.alert.value) }, sfMaxGap: num(f.sfMaxGap.value),
       depots: f.depots.value.split(",").map((s) => s.trim()).filter(Boolean),
-      materials: $$("#mats .inline-fields").map((r) => ({ id: r.dataset.id || undefined, name: $("[name=mname]", r).value.trim(), bagsPerM2: num($("[name=mbags]", r).value) })).filter((m) => m.name),
+      materials: $$("#mats .inline-fields").map((r) => ({ id: r.dataset.id || undefined, name: $("[name=mname]", r).value.trim(), bagsPerM2: num($("[name=mbags]", r).value), codes: $("[name=mcodes]", r).value, aConfirmer: $("[name=mconf]", r).checked })).filter((m) => m.name),
+      dateDebut: f.dateDebut.value, typesSuivis: f.typesSuivis.value.split("\n").map((x) => x.trim()).filter(Boolean),
     };
     if (!body.materials.length || !body.depots.length) return toast("Au moins un dépôt et une matière", true);
     try { S.config = await api("config", { method: "PUT", body }); toast("Règles enregistrées"); } catch (err) { toast(err.message, true); }
   };
 }
-const matRow = (m) => `<div class="inline-fields" data-id="${esc(m.id || "")}" style="margin-bottom:8px"><div class="field" style="flex:2 1 200px"><label>Nom</label><input name="mname" value="${esc(m.name)}"></div><div class="field"><label>Sacs / m² (R7)</label><input name="mbags" inputmode="decimal" value="${esc(String(m.bagsPerM2 ?? "").replace(".", ","))}"></div><button type="button" class="btn-ghost sm" data-rm>Retirer</button></div>`;
+const matRow = (m) => `<div class="inline-fields" data-id="${esc(m.id || "")}" style="margin-bottom:10px"><div class="field" style="flex:2 1 180px"><label>Nom</label><input name="mname" value="${esc(m.name)}"></div><div class="field" style="flex:2 1 180px"><label>Codes produit SF</label><input name="mcodes" value="${esc((m.codes || []).join(", "))}" placeholder="SUPA, SUPACOVER+"></div><div class="field" style="flex:1 1 110px"><label>Sacs / m² (R7)</label><input name="mbags" inputmode="decimal" value="${esc(String(m.bagsPerM2 ?? "").replace(".", ","))}"></div><div class="field" style="flex:0 0 auto"><label><input type="checkbox" name="mconf" style="width:auto" ${m.aConfirmer ? "checked" : ""}> À confirmer</label></div><button type="button" class="btn-ghost sm" data-rm>Retirer</button></div>`;
 
 render();
