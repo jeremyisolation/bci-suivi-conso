@@ -104,6 +104,22 @@ export default async (req) => {
       const users = await getUsers(store);
       return json({ needsSetup: users.length === 0 });
     }
+    // diagnostic technique (aucune donnée métier exposée)
+    if (r0 === "diag" && method === "GET") {
+      const out = { secretLen: (process.env.APP_SECRET || "").length };
+      try { const t = signToken({ t: 1, exp: Date.now() + 6e4 }); out.tokenRoundtrip = !!verifyToken(t); } catch (e) { out.tokenError = e.message; }
+      try {
+        const k = "diag/test";
+        await store.setJSON(k, { n: 1 });
+        const a = await store.getWithMetadata(k, { type: "json" });
+        out.etag = a?.etag;
+        const w = await store.setJSON(k, { n: 2 }, { onlyIfMatch: a.etag });
+        out.conditionalWrite = w.modified;
+        const b = await store.get(k, { type: "json" });
+        out.readBack = b?.n;
+      } catch (e) { out.blobError = e.message; }
+      return json(out);
+    }
     if (r0 === "setup" && method === "POST") {
       if (body.secret !== secret()) return fail(403, "Code d'installation incorrect");
       if (!body.login || !body.password || body.password.length < 8) return fail(400, "Identifiant et mot de passe (8 caractères min.) requis");
