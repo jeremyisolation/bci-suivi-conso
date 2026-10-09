@@ -60,23 +60,28 @@ function calc(c, cfg = S.config) {
   const th = cfg?.thresholds || { warn: 10, alert: 20 };
   const sfGap = (cfg?.sfMaxGap ?? 20) / 100;
   const s = c.saisie, v = c.validation;
-  const status = v ? "valide" : s ? "saisi" : "planifie";
+  const status = c.exclu ? "exclu" : v ? "valide" : s ? "saisi" : "planifie";
   const m = { status, alerts: [], level: "grey" };
   const p = c.sacsPrevus, sp = c.surfacePrevue;
   m.ratioPrevu = p && sp ? p / sp : null;
   m.sfMin = p ? Math.ceil(p * (1 - sfGap)) : null;
   m.sfMax = p ? Math.floor(p * (1 + sfGap)) : null;
+  if (c.exclu) return m;
+  const add = (lvl, txt) => m.alerts.push([lvl, txt]);
   if (!s) {
-    if (c.date < today()) { m.level = "orange"; m.alerts.push(["orange", "Chantier passé non saisi par l'équipe"]); }
+    if (c.date < today()) add("orange", "Chantier passé sans retour saisi");
+    if (v) add("orange", "Déclaré SF saisi sans sacs soufflés");
+    m.level = m.alerts.length ? "orange" : "grey";
     return m;
   }
-  m.ecartSacs = p ? ((s.sacsSouffles - p) / p) * 100 : null;
-  m.ecartSurface = sp ? ((s.surfaceMesuree - sp) / sp) * 100 : null;
-  m.ratio = s.surfaceMesuree ? s.sacsSouffles / s.surfaceMesuree : null;
+  const hasS = s.sacsSouffles !== null && s.sacsSouffles !== undefined, hasM = s.surfaceMesuree !== null && s.surfaceMesuree !== undefined;
+  m.ecartSacs = p && hasS ? ((s.sacsSouffles - p) / p) * 100 : null;
+  m.ecartSurface = sp && hasM ? ((s.surfaceMesuree - sp) / sp) * 100 : null;
+  m.ratio = hasS && s.surfaceMesuree ? s.sacsSouffles / s.surfaceMesuree : null;
   m.ecartRatio = m.ratio !== null && m.ratioPrevu ? ((m.ratio - m.ratioPrevu) / m.ratioPrevu) * 100 : null;
-  m.retourDepot = (s.sacsCharges ?? 0) - (s.sacsSouffles ?? 0);
-  m.surplusCharge = p ? (s.sacsCharges ?? 0) - p : null;
-  const add = (lvl, txt) => m.alerts.push([lvl, txt]);
+  m.retourDepot = s.sacsCharges !== null && s.sacsCharges !== undefined && hasS ? s.sacsCharges - s.sacsSouffles : null;
+  m.surplusCharge = p && s.sacsCharges !== null && s.sacsCharges !== undefined ? s.sacsCharges - p : null;
+  if (!hasS) add("orange", "Sacs soufflés non renseignés");
   if (m.ecartSurface !== null) {
     if (Math.abs(m.ecartSurface) > th.alert) add("red", `Surface mesurée ${pct(m.ecartSurface)} vs prévue`);
     else if (Math.abs(m.ecartSurface) > th.warn) add("orange", `Surface mesurée ${pct(m.ecartSurface)} vs prévue`);
@@ -89,20 +94,20 @@ function calc(c, cfg = S.config) {
   if (v) {
     m.declares = v.sacsDeclares;
     m.retourOfficiel = (p ?? 0) - v.sacsDeclares;
-    m.stock2 = v.sacsDeclares - s.sacsSouffles;
+    m.stock2 = hasS ? v.sacsDeclares - s.sacsSouffles : null;
     if (m.sfMin !== null && (v.sacsDeclares < m.sfMin || v.sacsDeclares > m.sfMax)) add("red", `Déclaré ${v.sacsDeclares} hors tolérance Salesforce (${m.sfMin}–${m.sfMax})`);
   }
   m.level = m.alerts.some((a) => a[0] === "red") ? "red" : m.alerts.some((a) => a[0] === "orange") ? "orange" : "green";
   return m;
 }
-const statusBadge = (st) => ({ planifie: '<span class="badge b-info">Planifié</span>', saisi: '<span class="badge b-warn">Saisi</span>', valide: '<span class="badge b-ok">Validé</span>' }[st]);
+const statusBadge = (st) => ({ planifie: '<span class="badge b-info">À remplir</span>', saisi: '<span class="badge b-warn">Réel saisi</span>', valide: '<span class="badge b-ok">Déclaré SF</span>', exclu: '<span class="badge">Non concerné</span>' }[st]);
 const levelRank = { red: 3, orange: 2, green: 1, grey: 0 };
 
 // Statistiques par équipe sur un ensemble de chantiers saisis
 function teamStats(items) {
   const t = {}, g = { souffles: 0, surface: 0, prevus: 0, n: 0 };
   for (const c of items) {
-    if (!c.saisie) continue;
+    if (!c.saisie || c.exclu) continue;
     const k = c.equipe || "(sans équipe)";
     const r = (t[k] ||= { equipe: k, n: 0, souffles: 0, surface: 0, prevus: 0, surfPrev: 0, charges: 0, declares: 0, nValid: 0, alertes: 0 });
     r.n++; r.souffles += c.saisie.sacsSouffles || 0; r.surface += c.saisie.surfaceMesuree || 0; r.prevus += c.sacsPrevus || 0;
@@ -122,7 +127,7 @@ function teamStats(items) {
 }
 
 // ---------- rendu / routage ----------
-const ROUTES_MANAGER = [["#/", "Tableau de bord"], ["#/equipes", "Équipes"], ["#/import", "Import planif"], ["#/stock", "Stock"]];
+const ROUTES_MANAGER = [["#/", "Saisie semaine"], ["#/tableau", "Tableau de bord"], ["#/equipes", "Équipes"], ["#/import", "Import planif"], ["#/stock", "Stock"]];
 function renderNav() {
   const tb = $("#topbar");
   if (!S.user) { tb.hidden = true; return; }
@@ -149,7 +154,8 @@ async function render() {
     if (r === "stock") return await viewStock();
     if (r === "equipes") return await viewEquipes();
     if (r === "params" && isAdmin()) return await viewParams();
-    return await viewDashboard();
+    if (r === "tableau") return await viewDashboard();
+    return await viewSemaine();
   } catch (e) {
     if (rid !== S.rid) return; // une autre page a été ouverte entre-temps : on ignore l'ancienne
     app.innerHTML = `<div class="card"><h3>Erreur</h3><p>${esc(e.message)}</p><button class="btn-secondary" onclick="location.reload()">Recharger</button></div>`;
@@ -319,7 +325,7 @@ async function viewDashboard() {
       <div class="field"><label>Du</label><input type="date" id="from" value="${DASH.from}"></div>
       <div class="field"><label>Au</label><input type="date" id="to" value="${DASH.to}"></div>
       <div class="field"><label>Équipe</label><select id="equipe"><option value="">Toutes</option></select></div>
-      <div class="field"><label>Statut</label><select id="statut"><option value="">Tous</option><option value="planifie">Planifié</option><option value="saisi">Saisi (à valider)</option><option value="valide">Validé</option></select></div>
+      <div class="field"><label>Statut</label><select id="statut"><option value="">Tous</option><option value="planifie">À remplir</option><option value="saisi">Réel saisi, SF à faire</option><option value="valide">Déclaré SF</option><option value="exclu">Non concerné</option></select></div>
       <div class="field"><label>Alerte</label><select id="niveau"><option value="">Toutes</option><option value="red">Rouge</option><option value="orange">Orange et +</option><option value="green">Vert</option></select></div>
       <div class="field"><label>Recherche</label><input id="q" placeholder="Client, réf., ville" value="${esc(DASH.q)}"></div>
     </div>
@@ -350,14 +356,15 @@ async function viewDashboard() {
     const rows = filtered();
     const col = cols.find((x) => x[0] === DASH.sort) || cols[0];
     rows.sort((a, b) => { const va = col[2](a), vb = col[2](b); if (va === vb) return a.date.localeCompare(b.date); if (va === null || va === undefined) return 1; if (vb === null || vb === undefined) return -1; return (va > vb ? 1 : -1) * DASH.dir; });
-    const sum = (f) => rows.reduce((s, c) => s + (f(c) || 0), 0);
-    const saisis = rows.filter((c) => c.saisie), valides = rows.filter((c) => c.validation);
+    const act = rows.filter((c) => !c.exclu);
+    const sum = (f) => act.reduce((s, c) => s + (f(c) || 0), 0);
+    const saisis = act.filter((c) => c.saisie?.sacsSouffles != null), valides = act.filter((c) => c.validation);
     const prevSaisis = saisis.reduce((s, c) => s + (c.sacsPrevus || 0), 0), soufSaisis = sum((c) => c.saisie?.sacsSouffles);
     const surfM = sum((c) => c.saisie?.surfaceMesuree);
-    const red = rows.filter((c) => c.m.level === "red").length;
-    const late = rows.filter((c) => !c.saisie && c.date < today()).length;
+    const red = act.filter((c) => c.m.level === "red").length;
+    const late = act.filter((c) => !c.saisie && c.date < today()).length;
     $("#kpis").innerHTML = [
-      [rows.length, "chantiers planifiés"], [`${saisis.length} / ${valides.length}`, "saisis / validés"],
+      [act.length, `chantiers suivis${rows.length - act.length ? ` (+${rows.length - act.length} non concernés)` : ""}`], [`${saisis.length} / ${valides.length}`, "réel saisi / déclaré SF"],
       [n0(prevSaisis), "sacs prévus (chantiers saisis)"], [n0(soufSaisis), "sacs soufflés"],
       [pct(prevSaisis ? ((soufSaisis - prevSaisis) / prevSaisis) * 100 : null), "écart soufflé vs prévu"],
       [surfM ? n2(soufSaisis / surfM) : "–", "sacs / m² mesuré"],
@@ -402,11 +409,175 @@ function exportCsv(rows) {
   const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" })); a.download = `suivi-conso_${DASH.from}_${DASH.to}.csv`; a.click();
 }
 
+// ---------- saisie bureau : tableau de la semaine ----------
+const mondayOf = (d) => { const x = new Date(d + "T12:00:00"); const k = (x.getDay() + 6) % 7; x.setDate(x.getDate() - k); return x.toISOString().slice(0, 10); };
+const SEM = { equipe: "", cacherComplets: false, ...(store.get("ss_sem") || {}), week: mondayOf(today()), mode: "week" };
+const dayLong = (d) => new Date(d + "T12:00:00").toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+
+async function viewSemaine() {
+  const cfg = S.config;
+  if (SEM.mode !== "late" && SEM.week < "2000") SEM.week = mondayOf(today());
+  const save = () => store.set("ss_sem", { equipe: SEM.equipe, cacherComplets: SEM.cacherComplets });
+  const isLate = SEM.mode === "late";
+  const from = isLate ? (cfg.dateDebut || addDays(today(), -60)) : SEM.week, to = isLate ? addDays(today(), -1) : addDays(SEM.week, 6);
+  app.innerHTML = `<p class="kicker">Retours chantier</p>
+    <div class="row"><h1 style="margin-right:auto">${isLate ? "Retards à remplir" : "Saisie de la semaine"}</h1>
+      ${isLate ? `<button class="btn-secondary" id="backWeek">← Revenir à la semaine</button>` : `<div class="datenav" style="margin:0"><button class="btn-secondary" id="prevW" aria-label="Semaine précédente">◀</button><button class="btn-secondary" id="thisW">Cette semaine</button><button class="btn-secondary" id="nextW" aria-label="Semaine suivante">▶</button></div>`}</div>
+    <p class="muted">${isLate ? `Chantiers passés depuis le ${fmtDate(from)} sans retour saisi.` : `Du ${dayLong(from)} au ${dayLong(to)}`}</p>
+    <div id="lateBanner"></div>
+    <div class="filters">
+      <div class="field"><label>Équipe</label><select id="fEq"><option value="">Toutes</option></select></div>
+      <div class="field" style="flex:0 0 auto;max-width:none"><label><input type="checkbox" id="fHide" style="width:auto" ${SEM.cacherComplets ? "checked" : ""}> Masquer les lignes complètes</label></div>
+      <div class="spacer"></div>
+      <div class="field" style="flex:0 0 auto;max-width:none" id="saveState"><span class="muted small">Enregistrement automatique</span></div>
+    </div>
+    <div id="semKpis" class="kpis"></div>
+    <div id="grid"><p class="muted">Chargement…</p></div>
+    <p class="muted small">Tapez directement dans les cellules : chaque ligne s'enregistre seule. Entrée ou ↓ passe à la ligne suivante, ↑ à la précédente. « Non concerné » sort le chantier de tous les calculs (stock, écarts, statistiques). Cliquez sur le nom pour ouvrir la fiche complète.</p>`;
+  if (!isLate) {
+    $("#prevW").onclick = () => { SEM.week = addDays(SEM.week, -7); save(); render(); };
+    $("#nextW").onclick = () => { SEM.week = addDays(SEM.week, 7); save(); render(); };
+    $("#thisW").onclick = () => { SEM.week = mondayOf(today()); save(); render(); };
+  } else $("#backWeek").onclick = () => { SEM.mode = "week"; save(); render(); };
+
+  let items = await api(`chantiers?from=${from}&to=${to}`);
+  if (isLate) items = items.filter((c) => !c.saisie && !c.exclu);
+  else {
+    const lateFrom = cfg.dateDebut || addDays(today(), -60), lateTo = addDays(SEM.week, -1);
+    if (lateTo >= lateFrom) api(`chantiers?from=${lateFrom}&to=${lateTo}`).then((l) => {
+      const n = l.filter((c) => !c.saisie && !c.exclu).length;
+      if (n) { $("#lateBanner").innerHTML = `<ul class="alerts-list"><li class="orange">${n} chantier(s) des semaines précédentes sans retour saisi. <a href="#" id="goLate">Les remplir</a></li></ul>`; $("#goLate").onclick = (e) => { e.preventDefault(); SEM.mode = "late"; save(); render(); }; }
+    }).catch(() => {});
+  }
+  const byId = new Map(items.map((c) => [c.id, c]));
+  const teams = [...new Set(items.map((c) => c.equipe).filter(Boolean))].sort();
+  $("#fEq").innerHTML = `<option value="">Toutes</option>` + teams.map((t) => `<option ${t === SEM.equipe ? "selected" : ""}>${esc(t)}</option>`).join("");
+  $("#fEq").onchange = (e) => { SEM.equipe = e.target.value; save(); draw(); };
+  $("#fHide").onchange = (e) => { SEM.cacherComplets = e.target.checked; save(); draw(); };
+
+  const complet = (c) => c.exclu || (c.saisie?.sacsSouffles != null && c.saisie?.surfaceMesuree != null && c.validation?.sacsDeclares != null);
+  const v = (x) => (x === null || x === undefined ? "" : String(x).replace(".", ","));
+
+  function kpis() {
+    const act = items.filter((c) => !c.exclu && (!SEM.equipe || c.equipe === SEM.equipe));
+    const sum = (f) => act.reduce((s, c) => s + (f(c) || 0), 0);
+    const nR = act.filter((c) => c.saisie?.sacsSouffles != null).length, nSF = act.filter((c) => c.validation).length;
+    const prevR = act.filter((c) => c.saisie?.sacsSouffles != null).reduce((s, c) => s + (c.sacsPrevus || 0), 0), souf = sum((c) => c.saisie?.sacsSouffles);
+    $("#semKpis").innerHTML = [
+      [act.length, "chantiers suivis"], [act.length - nR, "réel à saisir", act.length - nR ? "warn" : "ok"], [act.length - nSF, "déclaré SF à saisir", act.length - nSF ? "warn" : "ok"],
+      [`${n0(souf)} / ${n0(prevR)}`, "sacs soufflés / prévus (lignes saisies)"], [pct(prevR ? ((souf - prevR) / prevR) * 100 : null), "écart soufflé vs prévu"],
+      [n0(sum((c) => c.validation?.sacsDeclares)), "sacs déclarés SF"],
+    ].map(([val, l, cls]) => `<div class="kpi ${cls || ""}"><div class="v">${val}</div><div class="l">${l}</div></div>`).join("");
+  }
+
+  function rowHtml(c) {
+    const m = calc(c), dis = c.exclu ? "disabled" : "";
+    const sf = c.validation?.sacsDeclares, out = sf != null && m.sfMin !== null && (sf < m.sfMin || sf > m.sfMax);
+    return `<tr data-id="${esc(c.id)}" class="${c.exclu ? "row-exclu" : ""}">
+      <td><span class="dot ${m.level}" title="${esc(m.alerts.map((a) => a[1]).join(" · "))}"></span></td>
+      <td class="nw">${esc(c.equipe || "–")}</td>
+      <td><a href="#/chantier/${c.month}/${encodeURIComponent(c.id)}" class="cl">${esc(c.client || c.ref)}</a><div class="muted small">${esc([c.ville, c.cp].filter(Boolean).join(" "))} · ${esc(c.ref)}${c.produit ? ` · ${esc(c.produit)}` : ""}</div></td>
+      <td class="num">${n0(c.surfacePrevue)}</td>
+      <td><input class="cell" data-f="surfaceMesuree" inputmode="decimal" value="${v(c.saisie?.surfaceMesuree)}" ${dis}></td>
+      <td class="num"><b>${n0(c.sacsPrevus)}</b></td>
+      <td><input class="cell" data-f="sacsSouffles" inputmode="numeric" value="${v(c.saisie?.sacsSouffles)}" ${dis}></td>
+      <td class="num ecart ${m.ecartSacs > 0 ? "pos" : m.ecartSacs < 0 ? "neg" : ""}">${pct(m.ecartSacs)}</td>
+      <td><input class="cell ${out ? "out" : ""}" data-f="sacsDeclares" inputmode="numeric" value="${v(sf)}" placeholder="${m.sfMin !== null ? `${m.sfMin}–${m.sfMax}` : ""}" title="Tolérance Salesforce ${m.sfMin ?? "?"} à ${m.sfMax ?? "?"} sacs" ${dis}></td>
+      <td><select class="cell sel" data-f="depot" ${dis}>${cfg.depots.map((d) => `<option ${(c.saisie?.depot || cfg.depots[0]) === d ? "selected" : ""}>${esc(d)}</option>`).join("")}</select></td>
+      <td class="center"><input type="checkbox" class="cell chk" data-f="exclu" ${c.exclu ? "checked" : ""} title="Non concerné par le calcul"></td>
+      <td class="st"></td></tr>`;
+  }
+
+  function draw() {
+    kpis();
+    let rows = items.filter((c) => !SEM.equipe || c.equipe === SEM.equipe);
+    if (SEM.cacherComplets) rows = rows.filter((c) => !complet(c));
+    rows.sort((a, b) => a.date.localeCompare(b.date) || (a.equipe || "").localeCompare(b.equipe || "") || (a.client || "").localeCompare(b.client || ""));
+    if (!rows.length) { $("#grid").innerHTML = `<div class="card muted center">${items.length ? "Tout est rempli pour ce filtre." : isLate ? "Aucun retard : tous les chantiers passés sont remplis." : "Aucun chantier planifié cette semaine. Importez la planif Salesforce."}</div>`; return; }
+    const days = {}; rows.forEach((c) => (days[c.date] ||= []).push(c));
+    $("#grid").innerHTML = `<div class="table-wrap"><table class="grid-table"><thead><tr><th></th><th>Équipe</th><th>Chantier</th><th class="num">m² prévu</th><th>m² réel</th><th class="num">Sacs prévus</th><th>Sacs soufflés</th><th class="num">Écart</th><th>Déclaré SF</th><th>Dépôt</th><th>Non concerné</th><th></th></tr></thead><tbody>
+      ${Object.entries(days).map(([d, list]) => `<tr class="day"><td colspan="12">${dayLong(d)} <span>${list.length} chantier${list.length > 1 ? "s" : ""}</span></td></tr>${list.map(rowHtml).join("")}`).join("")}
+      </tbody></table></div>`;
+    wire();
+  }
+
+  // file d'enregistrement par ligne
+  const pending = new Map(); let inflight = 0;
+  const setState = () => { $("#saveState").innerHTML = inflight || pending.size ? `<span class="badge b-warn">Enregistrement…</span>` : `<span class="badge b-ok">Tout est enregistré</span>`; };
+  window.onbeforeunload = () => (inflight || pending.size ? "Des modifications sont en cours d'enregistrement" : undefined);
+
+  function queue(id, field, value) {
+    const p = pending.get(id) || { fields: {}, timer: null };
+    p.fields[field] = value;
+    clearTimeout(p.timer);
+    p.timer = setTimeout(() => flush(id), 350);
+    pending.set(id, p); setState();
+  }
+  async function flush(id) {
+    const p = pending.get(id); if (!p) return;
+    pending.delete(id);
+    const c = byId.get(id), tr = document.querySelector(`tr[data-id="${CSS.escape(id)}"]`), st = tr?.querySelector(".st");
+    const body = { ...p.fields };
+    if (("surfaceMesuree" in body || "sacsSouffles" in body) && !("depot" in body)) body.depot = tr?.querySelector('[data-f="depot"]')?.value;
+    inflight++; setState(); if (st) st.innerHTML = `<span class="muted">…</span>`;
+    try {
+      const upd = await api(`chantiers/${c.month}/${encodeURIComponent(id)}/ligne`, { method: "PUT", body });
+      Object.assign(c, upd); byId.set(id, c);
+      refreshRow(id, st);
+    } catch (err) {
+      if (st) st.innerHTML = `<span class="pos" title="${esc(err.message)}">⚠</span>`;
+      toast(`${c.client || c.ref} : ${err.message}`, true);
+    } finally { inflight--; setState(); }
+  }
+  function refreshRow(id, st) {
+    const c = byId.get(id), tr = document.querySelector(`tr[data-id="${CSS.escape(id)}"]`); if (!tr) return;
+    const m = calc(c);
+    tr.classList.toggle("row-exclu", !!c.exclu);
+    tr.querySelector(".dot").className = `dot ${m.level}`; tr.querySelector(".dot").title = m.alerts.map((a) => a[1]).join(" · ");
+    const e = tr.querySelector(".ecart"); e.textContent = pct(m.ecartSacs); e.className = `num ecart ${m.ecartSacs > 0 ? "pos" : m.ecartSacs < 0 ? "neg" : ""}`;
+    const sfi = tr.querySelector('[data-f="sacsDeclares"]'), sf = c.validation?.sacsDeclares;
+    sfi.classList.toggle("out", sf != null && m.sfMin !== null && (sf < m.sfMin || sf > m.sfMax));
+    $$("input.cell:not(.chk), select.cell", tr).forEach((i) => (i.disabled = !!c.exclu));
+    if (st) { st.innerHTML = `<span class="ok-tick">✓</span>`; setTimeout(() => { if (st.textContent === "✓") st.innerHTML = ""; }, 2500); }
+    kpis();
+  }
+  function wire() {
+    $$("#grid .cell").forEach((el) => {
+      const id = el.closest("tr").dataset.id, f = el.dataset.f;
+      if (el.type === "checkbox") el.onchange = () => { byId.get(id).exclu = el.checked; queue(id, f, el.checked); refreshRow(id); };
+      else if (el.tagName === "SELECT") el.onchange = () => queue(id, f, el.value);
+      else {
+        el.onchange = () => {
+          const raw = el.value.trim();
+          if (raw !== "" && (num(raw) === null || num(raw) < 0)) { el.classList.add("out"); return toast("Valeur invalide", true); }
+          el.classList.remove("out");
+          // calcul immédiat de l'écart avant même la réponse serveur
+          const c = byId.get(id);
+          if (f === "sacsDeclares") c.validation = raw === "" ? null : { ...(c.validation || {}), sacsDeclares: num(raw) };
+          else c.saisie = { ...(c.saisie || {}), [f]: num(raw) };
+          refreshRow(id);
+          queue(id, f, raw);
+        };
+        el.onkeydown = (e) => {
+          if (e.key === "Enter" || e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const all = $$(`#grid input.cell[data-f="${f}"]:not(:disabled)`), i = all.indexOf(el);
+            const nx = all[i + (e.key === "ArrowUp" || (e.key === "Enter" && e.shiftKey) ? -1 : 1)];
+            if (nx) { el.dispatchEvent(new Event("change")); nx.focus(); nx.select(); }
+          }
+        };
+        el.onfocus = () => el.select();
+      }
+    });
+  }
+  setState(); draw();
+}
+
 // ---------- fiche chantier + validation ----------
 async function viewChantier(month, id) {
   const c = await api(`chantiers/${month}/${encodeURIComponent(id)}`);
   const m = calc(c), s = c.saisie, v = c.validation;
-  app.innerHTML = `<a href="#/" class="small">← Tableau de bord</a>
+  app.innerHTML = `<a href="javascript:history.back()" class="small">← Retour</a>
     <div class="row"><h1>${esc(c.client || c.ref)}</h1>${statusBadge(m.status)}<span class="dot ${m.level}"></span></div>
     <p class="muted">${esc([c.adresse, c.ville].filter(Boolean).join(", "))} · ${fmtDate(c.date)} · ${esc(c.equipe)}${c.ref ? ` · ${esc(c.ref)}` : ""}</p>
     ${m.alerts.length ? `<ul class="alerts-list">${m.alerts.map(([l, t]) => `<li class="${l}">${esc(t)}</li>`).join("")}</ul>` : s ? `<ul class="alerts-list"><li class="blue">Aucune alerte sur ce chantier.</li></ul>` : ""}
@@ -704,7 +875,7 @@ function viewSalesforceImport(headers, rows, fileName) {
       $("#preview").innerHTML = `<div class="card"><h3>Import terminé</h3>
         <p><b>${tot.created}</b> nouveaux chantiers, <b>${tot.updated}</b> mis à jour, <b>${tot.moved}</b> replanifiés, ${tot.unchanged} inchangés${tot.locked ? `, ${tot.locked} validés non modifiés` : ""}${tot.skipped.length ? `, ${tot.skipped.length} ignorés` : ""}.</p>
         <p>${c.aPlanifier.length} dossiers à planifier enregistrés pour le calcul des besoins.</p>
-        <div class="row"><a class="btn" href="#/">Voir le tableau de bord</a><a class="btn btn-secondary" href="#/stock">Voir les besoins en sacs</a></div></div>`;
+        <div class="row"><a class="btn" href="#/">Saisir la semaine</a><a class="btn btn-secondary" href="#/stock">Voir les besoins en sacs</a></div></div>`;
       $("#map").innerHTML = ""; $("#file").value = "";
     } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = "Réessayer l'import (les paquets déjà passés ne seront pas dupliqués)"; }
   };
@@ -741,7 +912,7 @@ async function viewStock() {
     const [stock, mvs, futurs, backlog] = await Promise.all([api("stock"), api("mouvements"), api(`chantiers?from=${today()}&to=${addDays(today(), 60)}`), api("backlog")]);
     const bes = {};
     const b = (m) => (bes[m] ||= { m, nPl: 0, sPl: 0, nAp: 0, sAp: 0 });
-    futurs.filter((c) => !c.saisie).forEach((c) => { const r = b(c.materiau); r.nPl++; r.sPl += c.sacsPrevus || 0; });
+    futurs.filter((c) => !c.saisie && !c.exclu).forEach((c) => { const r = b(c.materiau); r.nPl++; r.sPl += c.sacsPrevus || 0; });
     (backlog.items || []).forEach((c) => { const r = b(c.materiau); r.nAp++; r.sAp += c.sacsPrevus || 0; });
     const phys = (m) => stock.filter((r) => r.materiau === m).reduce((s, r) => s + r.physique, 0);
     const rowsB = Object.values(bes).sort((x, y) => (y.sPl + y.sAp) - (x.sPl + x.sAp));
@@ -784,7 +955,7 @@ async function viewParams() {
     <form class="card" id="uf" style="margin-top:12px"><h3 id="ufTitle">Nouveau compte</h3><div class="inline-fields">
       <div class="field"><label>Identifiant</label><input name="login" required autocapitalize="off"></div>
       <div class="field"><label>Nom affiché</label><input name="name" required></div>
-      <div class="field"><label>Rôle</label><select name="role"><option value="equipe">Équipe</option><option value="resp">Responsable habilité</option><option value="admin">Administrateur</option></select></div>
+      <div class="field"><label>Rôle</label><select name="role"><option value="resp">Responsable habilité</option><option value="admin">Administrateur</option><option value="equipe">Équipe (accès poseur)</option></select></div>
       <div class="field"><label>Nom d'équipe (exactement comme dans la planif)</label><input name="team" list="teamList"></div>
       <div class="field"><label>Mot de passe <span id="pwHint">(6 caract. min.)</span></label><input name="password" type="text" autocomplete="new-password"></div>
       <div class="field" style="flex:0 0 auto"><label><input type="checkbox" name="active" checked style="width:auto"> Actif</label></div>

@@ -295,7 +295,7 @@ export default async (req) => {
         const from = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
         const keys = [];
         for (const m of monthsBetween(monthOf(from), monthOf(today))) keys.push(...(await listAll(store, `ch/${m}/`)));
-        let items = (await getMany(store, keys)).filter((c) => c.date >= from && c.date < today && !c.saisie);
+        let items = (await getMany(store, keys)).filter((c) => c.date >= from && c.date < today && !c.saisie && !c.exclu);
         if (user.role === "equipe") items = items.filter((c) => sameTeam(user, c));
         return json(items.sort((a, b) => a.date.localeCompare(b.date)));
       }
@@ -319,8 +319,8 @@ export default async (req) => {
           };
           if (!config.depots.includes(s.depot)) return fail(400, "Dépôt de départ requis");
           if (s.sacsSouffles === null || s.sacsSouffles < 0) return fail(400, "Nombre de sacs soufflés requis");
-          if (s.sacsCharges === null || s.sacsCharges < 0) return fail(400, "Nombre de sacs chargés requis");
-          if (s.sacsSouffles > s.sacsCharges) return fail(400, "Sacs soufflés supérieurs aux sacs chargés : vérifiez la saisie");
+          if (s.sacsCharges !== null && s.sacsCharges < 0) return fail(400, "Sacs chargés invalides");
+          if (s.sacsCharges !== null && s.sacsSouffles > s.sacsCharges) return fail(400, "Sacs soufflés supérieurs aux sacs chargés : vérifiez la saisie");
           if (s.surfaceMesuree === null || s.surfaceMesuree <= 0) return fail(400, "Surface mesurée requise");
           const res = await updateJSON(store, key, (cur) => {
             if (!cur) throw httpError(404, "Chantier introuvable");
@@ -332,13 +332,47 @@ export default async (req) => {
           }, { create: false });
           return json(res);
         }
+        // saisie bureau en tableau : réel + déclaré SF + exclusion, en un seul appel, sans verrou
+        if (method === "PUT" && r3 === "ligne") {
+          requireRole(user, "admin", "resp");
+          const config = await getConfig(store);
+          const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+          for (const k of ["surfaceMesuree", "sacsSouffles", "sacsDeclares"]) {
+            if (has(k) && body[k] !== "" && body[k] !== null && (num(body[k]) === null || num(body[k]) < 0)) return fail(400, "Valeur numérique invalide");
+          }
+          if (has("depot") && body.depot && !config.depots.includes(String(body.depot).toUpperCase())) return fail(400, "Dépôt inconnu");
+          const now = new Date().toISOString();
+          const res = await updateJSON(store, key, (cur) => {
+            if (!cur) throw httpError(404, "Chantier introuvable");
+            const next = { ...cur };
+            if (has("exclu")) next.exclu = !!body.exclu;
+            if (has("note")) next.note = String(body.note || "").slice(0, 500);
+            if (has("surfaceMesuree") || has("sacsSouffles") || has("depot")) {
+              const prev = cur.saisie || {};
+              const sa = {
+                ...prev,
+                depot: has("depot") ? String(body.depot || "").toUpperCase() || prev.depot || config.depots[0] : prev.depot || config.depots[0],
+                surfaceMesuree: has("surfaceMesuree") ? num(body.surfaceMesuree) : prev.surfaceMesuree ?? null,
+                sacsSouffles: has("sacsSouffles") ? num(body.sacsSouffles) : prev.sacsSouffles ?? null,
+                sacsCharges: prev.sacsCharges ?? null, photos: prev.photos || [], commentaire: prev.commentaire || "",
+                by: user.login, byName: user.name, at: now,
+              };
+              next.saisie = sa.surfaceMesuree === null && sa.sacsSouffles === null ? null : sa;
+            }
+            if (has("sacsDeclares")) {
+              const d = num(body.sacsDeclares);
+              next.validation = d === null ? null : { ...(cur.validation || {}), sacsDeclares: d, by: user.login, byName: user.name, at: now };
+            }
+            return next;
+          }, { create: false });
+          return json(res);
+        }
         if (method === "PUT" && r3 === "validation") {
           requireRole(user, "admin", "resp");
           const declares = num(body.sacsDeclares);
           if (declares === null || declares < 0) return fail(400, "Nombre de sacs déclarés dans Salesforce requis");
           const res = await updateJSON(store, key, (cur) => {
             if (!cur) throw httpError(404, "Chantier introuvable");
-            if (!cur.saisie) throw httpError(400, "L'équipe n'a pas encore saisi ce chantier");
             return { ...cur, validation: { sacsDeclares: declares, note: String(body.note || "").slice(0, 500), by: user.login, byName: user.name, at: new Date().toISOString() } };
           }, { create: false });
           return json(res);
@@ -399,7 +433,7 @@ export default async (req) => {
         row(mv.depot, mv.materiau).entrees += mv.qty;
       }
       for (const c of chs) {
-        if (!c.saisie) continue;
+        if (!c.saisie || c.exclu) continue;
         const r = row(c.saisie.depot, c.materiau);
         r.nbChantiers++;
         r.souffleTotal += c.saisie.sacsSouffles || 0;
@@ -413,7 +447,7 @@ export default async (req) => {
         const last = invs.filter((i) => i.depot === r.depot && resolveMat(i.materiau) === r.materiau).sort((a, b) => b.date.localeCompare(a.date) || b.at.localeCompare(a.at))[0];
         if (last) {
           const entreesAt = mvs.filter((m) => m.type !== "inventaire" && m.depot === r.depot && resolveMat(m.materiau) === r.materiau && m.date <= last.date).reduce((s, m) => s + m.qty, 0);
-          const souffleAt = chs.filter((c) => c.saisie && c.saisie.depot === r.depot && resolveMat(c.materiau) === r.materiau && c.date <= last.date).reduce((s, c) => s + (c.saisie.sacsSouffles || 0), 0);
+          const souffleAt = chs.filter((c) => c.saisie && !c.exclu && c.saisie.depot === r.depot && resolveMat(c.materiau) === r.materiau && c.date <= last.date).reduce((s, c) => s + (c.saisie.sacsSouffles || 0), 0);
           const theorique = entreesAt - souffleAt;
           r.inventaire = { date: last.date, compte: last.qty, theorique, ecart: last.qty - theorique };
         }

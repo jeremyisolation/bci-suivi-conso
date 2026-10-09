@@ -176,3 +176,21 @@ footer.foot { position: relative; z-index: 1; max-width: 1280px; margin: 0 auto;
   .card { padding: 16px; }
 }
 .grid > .card + .card { margin-top: 0; }
+
+/* saisie semaine (tableau) */
+.grid-table td { padding: 6px 8px; }
+.grid-table input.cell { width: 86px; padding: 7px 9px; font-size: 14px; border-radius: 9px; text-align: right; background: #fff; }
+.grid-table select.cell { width: auto; padding: 7px 8px; font-size: 13px; border-radius: 9px; background: #fff; }
+.grid-table input.cell:focus { box-shadow: 0 0 0 3px var(--red-soft); }
+.grid-table input.cell.out { border-color: var(--red); background: var(--red-soft); color: var(--red-dark); }
+.grid-table input.chk { width: 20px; height: 20px; accent-color: var(--red); cursor: pointer; }
+.grid-table tr.day td { background: var(--ink); color: #fff; font-weight: 800; text-transform: capitalize; letter-spacing: -.01em; padding: 9px 12px; }
+.grid-table tr.day td span { font-weight: 600; color: #D4DADC; text-transform: none; margin-left: 8px; font-size: .82rem; }
+.grid-table tr.row-exclu td { opacity: .45; }
+.grid-table tr.row-exclu td:nth-last-child(2) { opacity: 1; }
+.grid-table a.cl { color: var(--ink); text-decoration: none; font-weight: 700; }
+.grid-table a.cl:hover { color: var(--red); text-decoration: underline; }
+.grid-table td.st { width: 28px; text-align: center; }
+.ok-tick { color: var(--ok); font-weight: 800; }
+td.center { text-align: center; }
+.datenav button { white-space: nowrap; width: auto; padding-left: 14px; padding-right: 14px; }
