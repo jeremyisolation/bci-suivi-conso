@@ -5,13 +5,16 @@ import { getStoreInstance, listAll, getMany, updateJSON } from "./lib/store.mjs"
 // Matières : codes = préfixes du « Produit à Poser » Salesforce (ex. SUPAR7 → SUPA, R7)
 // bagsPerM2 = sacs par m² pour un R7 ; le prévu est proportionnel au R du produit
 const DEFAULT_MATERIALS = [
-  { id: "supafil", name: "SUPAFIL (Cover+)", codes: ["SUPACOVER+", "MIKITSUPA", "SUPA"], bagsPerM2: 0.21 },
-  { id: "meca", name: "MECA", codes: ["MECA"], bagsPerM2: 0.21, aConfirmer: true },
-  { id: "roche", name: "ROCHE", codes: ["ROCHE"], bagsPerM2: 0.21, aConfirmer: true },
-  { id: "igloo", name: "IGLOO", codes: ["IGLOO"], bagsPerM2: 0.21, aConfirmer: true },
-  { id: "mesange", name: "MESANGE", codes: ["MESANGE"], bagsPerM2: 0.21, aConfirmer: true },
-  { id: "ouatitude", name: "OUATTITUDE", codes: ["OUATTITUDE"], bagsPerM2: 0.21, aConfirmer: true },
+  { id: "supafil", name: "SUPAFIL (Cover+)", codes: ["SUPACOVER+", "MIKITSUPA", "SUPA"], bagsPerM2: 0.2065 },
+  { id: "meca", name: "MECA (Mecawool)", codes: ["MECA"], bagsPerM2: 0.2041 },
+  { id: "roche", name: "ROCHE (Rockprime 2)", codes: ["ROCHE"], bagsPerM2: 0.2975 },
+  { id: "mesange", name: "MESANGE", codes: ["MESANGE"], bagsPerM2: 0.2171 },
+  { id: "isolene", name: "ISOLENE+", codes: ["ISOL"], bagsPerM2: 0.1965 },
+  { id: "igloo", name: "IGLOO (ouate)", codes: ["IGLOO"], bagsPerM2: 0.8889 },
+  { id: "ouatitude", name: "OUATTITUDE (ouate)", codes: ["OUATTITUDE"], bagsPerM2: 1.05 },
 ];
+// rendements R7 théoriques issus de l'export Salesforce « Suivi des densités » du 10/10/2026
+const MATERIALS_VERSION = 2;
 const DEFAULT_CONFIG = {
   targetCm: 33,
   depots: ["BEYNOST", "FIRMINY"],
@@ -86,6 +89,14 @@ async function getConfig(store) {
   const out = { ...DEFAULT_CONFIG, ...c, thresholds: { ...DEFAULT_CONFIG.thresholds, ...(c.thresholds || {}) } };
   // ancienne config sans codes produits → matières par défaut
   if (!Array.isArray(c.materials) || !c.materials.some((m) => Array.isArray(m.codes) && m.codes.length)) out.materials = DEFAULT_MATERIALS;
+  else if ((c.materialsVersion || 1) < MATERIALS_VERSION) {
+    // mise à jour des rendements depuis les densités Salesforce : on garde les noms et codes saisis, on remplace les rendements
+    const byId = Object.fromEntries(DEFAULT_MATERIALS.map((m) => [m.id, m]));
+    const mats = c.materials.map((m) => (byId[m.id] ? { ...m, bagsPerM2: byId[m.id].bagsPerM2, aConfirmer: false } : m));
+    for (const d of DEFAULT_MATERIALS) if (!mats.some((m) => m.id === d.id)) mats.push(d);
+    out.materials = mats;
+  }
+  out.materialsVersion = MATERIALS_VERSION;
   return out;
 }
 async function getUsers(store) {
